@@ -1,0 +1,9 @@
+# General
+*.txt
+*.wav
+
+# MSVC
+*.obj
+*.bin
+*.csv
+*.exe
