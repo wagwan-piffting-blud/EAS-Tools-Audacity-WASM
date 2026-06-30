@@ -54,6 +54,11 @@ region_t* mem_region_of(uint32_t va) {
 
 uint8_t* mem_host(uint32_t va) { return xlat(va); }
 
+// JIT: base address of the page-map array (a host pointer = a WASM linear-memory offset). Stable for
+// the process lifetime (the array is calloc'd once and never freed). Compiled blocks inline
+// g_pagemap[va>>12] to translate guest VAs without a call.
+uint32_t mem_pagemap_base(void){ return (uint32_t)(uintptr_t)g_pagemap; }
+
 static int g_faults = 0;
 static void fault(uint32_t va, const char* what) {
     CPU.faulted = 1; CPU.fault_addr = va; CPU.fault_msg = what; CPU.halted = 1;

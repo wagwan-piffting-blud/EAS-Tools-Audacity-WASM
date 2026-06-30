@@ -6,18 +6,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 cpu_t CPU;
 
 void win32_dispatch(uint32_t va);   // win32.c
 int  win32_is_import_va(uint32_t va);
+region_t* mem_region_of(uint32_t va);   // mem.c
+void jit_reset(void);               // JIT cache flush (defined below; called from cpu_reset)
+
+// Cached code region: virtually all execution stays inside the loaded image, so derive the
+// instruction host pointer with register arithmetic (base + (eip-lo)) instead of a per-instruction
+// page-map array load. Reset on each load (cpu_reset) so a re-load can't reuse a freed host base.
+static uint8_t*  g_code_host = 0;
+static uint32_t  g_code_lo   = 0;
+static uint32_t  g_code_size = 0;
 
 // ALU logic helpers (defined at end of file)
 uint32_t do_logic_or (uint32_t a,uint32_t b,int sz);
 uint32_t do_logic_and(uint32_t a,uint32_t b,int sz);
 uint32_t do_logic_xor(uint32_t a,uint32_t b,int sz);
 
-void cpu_reset(void){ memset(&CPU,0,sizeof CPU); CPU.eflags=0x202; CPU.fpu_cw=0x037f; CPU.fpu_top=8; CPU.mxcsr=0x1f80; }
+void cpu_reset(void){ memset(&CPU,0,sizeof CPU); CPU.eflags=0x202; CPU.fpu_cw=0x037f; CPU.fpu_top=8; CPU.mxcsr=0x1f80;
+    g_code_host=0; g_code_lo=0; g_code_size=0; jit_reset(); }
 // x87 FIST/FISTP/FRNDINT round per FPU control-word RC bits (10-11); default 00 = round-to-nearest-even
 static double fpu_round_rc(double v){
     switch((CPU.fpu_cw>>10)&3){
@@ -27,6 +40,20 @@ static double fpu_round_rc(double v){
         default: return nearbyint(v); // 0: nearest (host default FE_TONEAREST = nearest-even)
     }
 }
+
+// JIT x87 trampolines: reuse the EXACT interpreter C (same emcc, same flags) so the JIT's FIST/FISTP and
+// transcendentals match bit-for-bit by construction (incl. the float->int conversion's edge behavior and
+// fpu_round_rc reading the live CPU.fpu_cw). Compiled blocks call_indirect these by their function-table
+// index; jit_helpers (wasm_main.c) takes their addresses, which forces a table slot and returns the indices.
+int32_t jit_f2i(double v){ return (int32_t)fpu_round_rc(v); }
+double  jit_frndint(double v){ return fpu_round_rc(v); }
+double  jit_f2xm1(double x){ return pow(2.0,x)-1.0; }
+double  jit_fyl2x(double y,double x){ return y*(log(x)/log(2.0)); }
+double  jit_ftan(double x){ return tan(x); }
+double  jit_fpatan(double y,double x){ return atan2(y,x); }
+double  jit_fsin(double x){ return sin(x); }
+double  jit_fcos(double x){ return cos(x); }
+double  jit_fscale(double a,double b){ return ldexp(a,(int)b); }
 void cpu_push32(uint32_t v){ CPU.r[ESP]-=4; wr32(CPU.r[ESP], v); }
 uint32_t cpu_pop32(void){ uint32_t v=rd32(CPU.r[ESP]); CPU.r[ESP]+=4; return v; }
 
@@ -42,6 +69,12 @@ static uint32_t fetch32(void){ uint32_t v; memcpy(&v,g_ip,4); g_ip+=4; CPU.eip+=
 // ---------------- flags ----------------
 static const uint32_t SZMASK[5]={0,0xff,0xffff,0,0xffffffff};
 static const uint32_t SIGN[5]  ={0,0x80,0x8000,0,0x80000000};
+// 1 for each x86 legacy/REX-less prefix byte; lets the hot path reject the common
+// no-prefix case with a single table lookup instead of a chain of 8+ comparisons.
+static const uint8_t IS_PREFIX[256]={
+    [0x66]=1,[0x67]=1,[0xF0]=1,[0xF2]=1,[0xF3]=1,
+    [0x2E]=1,[0x36]=1,[0x3E]=1,[0x26]=1,[0x64]=1,[0x65]=1,
+};
 static int parity8(uint32_t v){ v&=0xff; v^=v>>4; v^=v>>2; v^=v>>1; return (~v)&1; }
 static void set_szp(uint32_t res,int sz){
     uint32_t m=SZMASK[sz]; res&=m;
@@ -92,14 +125,14 @@ static uint32_t do_dec(uint32_t a,int sz){ uint32_t res=(a-1)&SZMASK[sz]; int cf
 
 // ---------------- register file access by encoded index+size ----------------
 static uint32_t getreg(int idx,int sz){
-    if(sz==1){ if(idx<4) return CPU.r[idx]&0xff; return (CPU.r[idx-4]>>8)&0xff; }
+    if(sz==4) return CPU.r[idx];                                 // common 32-bit path first
     if(sz==2) return CPU.r[idx]&0xffff;
-    return CPU.r[idx];
+    if(idx<4) return CPU.r[idx]&0xff; return (CPU.r[idx-4]>>8)&0xff;
 }
 static void setreg(int idx,int sz,uint32_t v){
-    if(sz==1){ if(idx<4) CPU.r[idx]=(CPU.r[idx]&~0xffu)|(v&0xff); else CPU.r[idx-4]=(CPU.r[idx-4]&~0xff00u)|((v&0xff)<<8); }
-    else if(sz==2) CPU.r[idx]=(CPU.r[idx]&~0xffffu)|(v&0xffff);
-    else CPU.r[idx]=v;
+    if(sz==4){ CPU.r[idx]=v; return; }                          // common 32-bit path first
+    if(sz==2){ CPU.r[idx]=(CPU.r[idx]&~0xffffu)|(v&0xffff); return; }
+    if(idx<4) CPU.r[idx]=(CPU.r[idx]&~0xffu)|(v&0xff); else CPU.r[idx-4]=(CPU.r[idx-4]&~0xff00u)|((v&0xff)<<8);
 }
 
 // ---------------- ModRM ----------------
@@ -604,9 +637,50 @@ static void trap(const char* what,uint32_t eip0){
 
 int ITRACE = 0; static int itrace_count = 0; static uint32_t g_p5 = 0;
 uint64_t g_insns = 0;   // total guest instructions executed (profiling)
+uint64_t g_ophist[1024];  // PROFILING: [op] for 1-byte, [256+op2] for 0F xx (temporary)
 // focused x87 trace (env EMU_FPUTRACE=lo,hi,max)
 static int g_fputrace=-1, g_ftn=0, g_ftmax=0; static uint32_t g_ftlo=0, g_fthi=0;
 static int g_newbt = -1;   // BT/BTS memory-operand byte-addressing fix; EMU_OLDBT=1 forces legacy (buggy) path
+
+// ---------------- JIT dispatch (Phase 1: plumbing + deopt; empty blocks just deopt) ----------------
+// A compiled block is a () -> i32 WASM function in the shared __indirect_function_table; it reads/writes
+// the global CPU + linear memory directly and returns a status. The interpreter stays the baseline and
+// the deopt fallback, so correctness never depends on JIT coverage.
+#define JIT_OK 0
+#define JIT_DEOPT 1
+#define JIT_FAULT 2
+typedef int (*jit_block_fn)(void);
+#ifdef __EMSCRIPTEN__
+EM_JS(int, emu_jit_request, (unsigned eip), { return (Module.__jit_compile ? (Module.__jit_compile(eip) | 0) : -1); });
+EM_JS(void, emu_jit_flush, (void), { if (Module.__jit_flush) Module.__jit_flush(); });
+#else
+static int emu_jit_request(unsigned eip){ (void)eip; return -1; }
+static void emu_jit_flush(void){}
+#endif
+#define JITMAP_BITS 17
+#define JITMAP_SIZE (1u<<JITMAP_BITS)
+#define JITMAP_MASK (JITMAP_SIZE-1)
+typedef struct { uint32_t eip; int32_t slot; uint32_t count; } jitent_t;  // slot: table idx, -1 new, -2 tried+failed
+static jitent_t* g_jitmap = 0;
+int g_jit_enabled = 0, g_jit_force = 0, g_jit_threshold = 50;
+uint64_t g_jit_calls = 0, g_jit_deopts = 0, g_jit_compiles = 0;
+void jit_reset(void){
+    if(!g_jit_enabled && !g_jitmap) return;   // JIT never used this session -> no allocation, zero overhead
+    if(!g_jitmap) g_jitmap = (jitent_t*)malloc(JITMAP_SIZE*sizeof(jitent_t));
+    if(g_jitmap) for(uint32_t i=0;i<JITMAP_SIZE;i++){ g_jitmap[i].eip=0xFFFFFFFFu; g_jitmap[i].slot=-1; g_jitmap[i].count=0; }
+    g_jit_calls=g_jit_deopts=g_jit_compiles=0;
+    emu_jit_flush();   // jitmap cleared -> tell JS to free the now-orphaned compiled-block instances (null their table slots)
+}
+// JIT block linking: base of g_jitmap so compiled blocks can inline the lookup (entry = base + ((eip>>1)&
+// JITMAP_MASK)*12; eip@0, slot@4) and return_call_indirect a compiled successor directly. The runtime eip==
+// target check makes it eviction-safe. 0 until the map is allocated (first jit_set_enabled).
+uint32_t jit_jitmap_addr(void){ return (uint32_t)(uintptr_t)g_jitmap; }
+static inline jitent_t* jit_find(uint32_t eip){
+    jitent_t* e = &g_jitmap[(eip>>1) & JITMAP_MASK];
+    if(e->eip != eip){ e->eip=eip; e->slot=-1; e->count=0; }   // miss or collision -> (re)claim the slot
+    return e;
+}
+
 int cpu_run(uint64_t max_insns){
     if(g_newbt<0) g_newbt = getenv("EMU_OLDBT") ? 0 : 1;
     if(g_fputrace<0){ const char* e=getenv("EMU_FPUTRACE"); if(e){ unsigned lo,hi,mx; if(sscanf(e,"%x,%x,%u",&lo,&hi,&mx)==3){ g_ftlo=lo; g_fthi=hi; g_ftmax=mx; g_fputrace=1; } else g_fputrace=0; } else g_fputrace=0; }
@@ -615,7 +689,9 @@ int cpu_run(uint64_t max_insns){
     if(g_dumpat==0xffffffff){ const char* e=getenv("EMU_DUMPAT"); g_dumpat = e? (uint32_t)strtoul(e,0,16) : 0; }
     int trace = ITRACE || EMU_VERBOSE || (g_fputrace>0) || g_dumpat;   // hoist all debug out of the hot path
     for(uint64_t n=0; n<max_insns; n++){
+#ifdef EMU_OPHIST
         g_insns++;
+#endif
         if(CPU.halted){
             if(trace && CPU.faulted && !g_dumped){ g_dumped=1;
                 fprintf(stderr,"[fault-ring] eip=%08x fault@%08x eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
@@ -625,6 +701,21 @@ int cpu_run(uint64_t max_insns){
             return CPU.faulted?-1:1;
         }
         if(CPU.eip==RET_SENTINEL) return 1;
+        if(g_jit_enabled && g_jitmap){
+            jitent_t* je = jit_find(CPU.eip);
+            if(je->slot >= 0){
+                g_jit_calls++;
+                int rc = ((jit_block_fn)(uintptr_t)je->slot)();   // call_indirect the compiled block
+                if(rc == JIT_OK) continue;                        // block already advanced CPU.eip
+                g_jit_deopts++;                                   // DEOPT/FAULT -> interpret from CPU.eip
+            } else if(je->slot == -1){
+                if(g_jit_force || ++je->count >= (uint32_t)g_jit_threshold){
+                    int idx = emu_jit_request(CPU.eip);
+                    je->slot = (idx > 0) ? idx : -2;
+                    if(idx > 0) g_jit_compiles++;
+                }
+            }
+        }
         if(g_dumpat && CPU.eip==g_dumpat && !g_dumped){ g_dumped=1;
             fprintf(stderr,"[dumpat %08x] retaddr=%08x arg0=%08x eax=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
                 CPU.eip,rd32(CPU.r[ESP]),rd32(CPU.r[ESP]+4),CPU.r[EAX],CPU.r[ECX],CPU.r[EDX],CPU.r[ESI],CPU.r[EDI],CPU.r[EBP],CPU.r[ESP]);
@@ -632,11 +723,7 @@ int cpu_run(uint64_t max_insns){
             fprintf(stderr,"  ebp+ :"); for(int s=0;s<10;s++) fprintf(stderr," [ebp+%02x]=%08x", s*4, rd32(CPU.r[EBP]+s*4)); fprintf(stderr,"\n");
             fprintf(stderr,"  call chain (newest last):\n");
             for(int s=0;s<512;s++){ fprintf(stderr," %08x", eipring[(eipri+s)&511]); if((s&15)==15) fprintf(stderr,"\n"); } fprintf(stderr,"\n"); }
-        if(CPU.eip < 0x1000){ fprintf(stderr,"[null-call] eip=%08x eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
-                CPU.eip, CPU.r[EAX], CPU.r[EBX], CPU.r[ECX], CPU.r[EDX], CPU.r[ESI], CPU.r[EDI], CPU.r[EBP], CPU.r[ESP]);
-            if(trace){ fprintf(stderr,"  call chain (newest last):\n");
-                for(int s=0;s<512;s++){ fprintf(stderr," %08x", eipring[(eipri+s)&511]); if((s&15)==15) fprintf(stderr,"\n"); } fprintf(stderr,"\n"); }
-            CPU.faulted=1; CPU.halted=1; return -1; }
+        // (null-call eip<0x1000 is handled by the code-region resolver below: mem_region_of()==NULL -> trap)
         if(trace){
         eipring[eipri&511]=CPU.eip; eipri++;
         if(g_fputrace && CPU.eip>=g_ftlo && CPU.eip<g_fthi && g_ftn<g_ftmax){ g_ftn++;
@@ -693,25 +780,29 @@ int cpu_run(uint64_t max_insns){
             }
         }
         }   // end if(trace)
-        if(win32_is_import_va(CPU.eip)){ win32_dispatch(CPU.eip); continue; }
         uint32_t eip0=CPU.eip;
-        g_ip = mem_host(CPU.eip);                  // raw code pointer for this instruction
-        if(!g_ip){ trap("fetch", eip0); break; }
+        if((uint32_t)(eip0 - g_code_lo) >= g_code_size){   // outside cached code region (rare: branch into another region)
+            if(win32_is_import_va(eip0)){ win32_dispatch(eip0); continue; }   // import thunk dispatch (was per-instruction; now only on region miss)
+            region_t* r = mem_region_of(eip0);
+            if(!r){ if(eip0<0x1000) fprintf(stderr,"[null-call] eip=%08x esp=%08x\n",eip0,CPU.r[ESP]); trap("fetch", eip0); break; }
+            g_code_host=r->host; g_code_lo=r->va; g_code_size=r->size;
+        }
+        g_ip = g_code_host + (eip0 - g_code_lo);    // raw code pointer (register arithmetic, no page-map load)
         // ---- prefixes ----
-        int opsz=4, rep=0, repne=0; g_seg_base=0; int lock=0; (void)lock;
-        for(;;){
-            uint8_t p=*g_ip;
-            if(p==0x66){ opsz=2; g_ip++; CPU.eip++; }
-            else if(p==0x67){ g_ip++; CPU.eip++; }
-            else if(p==0xF0){ lock=1; g_ip++; CPU.eip++; }
-            else if(p==0xF2){ repne=1; g_ip++; CPU.eip++; }
-            else if(p==0xF3){ rep=1; g_ip++; CPU.eip++; }
-            else if(p==0x2E||p==0x36||p==0x3E||p==0x26){ g_ip++; CPU.eip++; } // CS/SS/DS/ES = flat
-            else if(p==0x64){ g_seg_base=CPU.seg_fs_base; g_ip++; CPU.eip++; }
-            else if(p==0x65){ g_seg_base=CPU.seg_gs_base; g_ip++; CPU.eip++; }
-            else break;
+        int opsz=4, rep=0, repne=0; g_seg_base=0;
+        while(IS_PREFIX[*g_ip]){
+            uint8_t p=*g_ip; g_ip++; CPU.eip++;
+            if(p==0x66) opsz=2;
+            else if(p==0xF2) repne=1;
+            else if(p==0xF3) rep=1;
+            else if(p==0x64) g_seg_base=CPU.seg_fs_base;
+            else if(p==0x65) g_seg_base=CPU.seg_gs_base;
+            // 0x67 (addr-size), 0xF0 (lock), 0x2E/36/3E/26 (CS/SS/DS/ES, flat) = no effect
         }
         uint8_t op=fetch8();
+#ifdef EMU_OPHIST
+        g_ophist[op]++;
+#endif
         modrm_t m;
         switch(op){
         // ----- ALU reg/rm families: 00..3D -----
@@ -892,6 +983,9 @@ int cpu_run(uint64_t max_insns){
             if(!do_x87(op)) trap("x87",eip0); break;
 
         case 0x0F: { uint8_t op2=fetch8();
+#ifdef EMU_OPHIST
+            g_ophist[256+op2]++;
+#endif
             if(sse_is(op2)){ int ssep = rep?2 : repne?3 : (opsz==2)?1 : 0; if(!do_sse(op2,ssep)) trap("sse",eip0); }
             else if(op2>=0x80 && op2<=0x8F){ int32_t d=(int32_t)(opsz==2?(int16_t)fetch16():(int32_t)fetch32()); if(cond(op2-0x80)) CPU.eip+=d; }
             else if(op2>=0x90 && op2<=0x9F){ decode_modrm(&m,0); rm_write(&m,1,cond(op2-0x90)?1:0); }

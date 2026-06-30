@@ -11,8 +11,11 @@ $exportedFns = "['_vst_w_load','_vst_w_numparams','_vst_w_numinputs','_vst_w_num
                "'_vst_w_effectname','_vst_w_vendor','_vst_w_paramname','_vst_w_paramdisplay','_vst_w_faulted'," +
                "'_ladspa_w_load','_ladspa_w_prepare','_ladspa_w_numinputs','_ladspa_w_numoutputs'," +
                "'_ladspa_w_apply_macro','_ladspa_w_process','_ladspa_w_faulted'," +
+               "'_emu_ophist_dump','_emu_ophist_reset'," +
+               "'_jit_cpu_addr','_jit_pagemap_base','_jit_layout','_jit_helpers','_jit_jitmap_base'," +
+               "'_jit_set_enabled','_jit_set_force','_jit_set_threshold','_jit_stats'," +
                "'_malloc','_free']"
-$exportedRt  = "['ccall','cwrap','UTF8ToString','stringToUTF8','lengthBytesUTF8','HEAPU8','HEAPF32','HEAP32']"
+$exportedRt  = "['ccall','cwrap','UTF8ToString','stringToUTF8','lengthBytesUTF8','HEAPU8','HEAPF32','HEAP32','HEAPU32','wasmMemory','wasmTable','addFunction','removeFunction']"
 
 # ladspa_host.c uses -DLADSPA_STANDALONE_LOG so it shares vst_host.c's call_guest/emu_log/EMU_VERBOSE
 # (no duplicate symbols) instead of defining its own.
@@ -23,6 +26,7 @@ emcc mem.c cpu.c loader.c win32_vst.c vst_host.c ladspa_host.c wasm_main.c `
   -s MODULARIZE=1 -s "EXPORT_NAME=VstEmuModule" `
   -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=33554432 -s MAXIMUM_MEMORY=536870912 `
   -s STACK_SIZE=2097152 `
+  -s ALLOW_TABLE_GROWTH=1 `
   -s "EXPORTED_FUNCTIONS=$exportedFns" `
   -s "EXPORTED_RUNTIME_METHODS=$exportedRt" `
   -s "ENVIRONMENT=web,worker,node" `

@@ -75,7 +75,67 @@ Audacity 2.4.2 via the scripting-pipe harness (`diag_audacity.py` → `compare.p
   ops (`Delete`/`Trim`/`SetTrack`/`TrackMove`) which are deliberate no-ops in the single-buffer
   model. `ChannelMixer` is a correct no-op (all macro uses are on mono tracks).
 
+## 2026-06-30 — performance: x86→WASM JIT + Web-Worker parallelism
+
+The renderer was *correct* but slow: a 172 s sample took ~100 s on the `NWR-KIG76Prototype`
+macro (vs ~20.7 s in native Audacity). Profiling put the cost in the interpreter itself
+(~80 M guest-instr/s; x87 ≈ 44 % of executed instructions, MOV ≈ 34 %), and the contained
+interpreter optimizations were exhausted. The multiplicative win is a runtime JIT plus
+parallelism. The JavaScript codegen lives in EAS Tools (`jit-wasm-encoder.js`, `jit-compiler.js`,
+`worker-pool.js`, `resample-worker.js`, `plugin-worker.js`); the C side here gained the dispatch,
+trampolines and layout exports. Recorded here because it closes out the in-browser renderer.
+
+- **Runtime x86→WASM JIT (v86-style), bit-exact by construction.** `cpu_run` stays as baseline +
+  deopt fallback. New in `cpu.c`: a hotness map `g_jitmap` (`jitent_t{eip,slot,count}`, keyed
+  `(eip>>1)&mask`), `jit_find`/`jit_reset`, an `emu_jit_request(eip)` `EM_JS` that calls
+  `Module.__jit_compile` (synchronous so the new table slot is live this `cpu_run`), the dispatch
+  hook at the top of the `cpu_run` loop, and **9 libm trampolines** (`jit_f2i`, `jit_frndint`,
+  `jit_f2xm1`, `jit_fyl2x`, `jit_ftan`, `jit_fpatan`, `jit_fsin`, `jit_fcos`, `jit_fscale`). New
+  in `wasm_main.c`: `jit_set_enabled`/`jit_set_force`/`jit_set_threshold`/`jit_stats` and the
+  layout exports `jit_helpers`/`jit_cpu_addr`/`jit_layout`/`jit_pagemap_base`/`jit_jitmap_base`.
+  `build_wasm.ps1`: `ALLOW_TABLE_GROWTH`, exposed `wasmMemory`/`wasmTable`, the `_jit_*` exports.
+  Hot blocks compile to WASM functions that share the global `CPU` + linear memory; untranslatable
+  ops deopt to the interpreter, so correctness never depends on coverage. **x87 stays bit-exact**
+  because the JIT emits WASM `f64` and calls the *same* C trampolines the interpreter uses (the
+  x87 stack is already C `double` + libm), not a re-derivation. P0–P5 (integer/MOV/LEA/branch,
+  x87, SSE/SSE2 scalar, string ops) verified bit-exact via a forced-compile differential harness.
+- **JS-heap OOM fix (V8 table-import retention).** The first integration OOM'd after a few macros:
+  V8 permanently retains WASM instances that *import a table*. Fixed by importing only the memory
+  and passing the 9 trampolines as **function imports** (no table import).
+- **Region batching (Firefox exec-memory OOM #1).** Per-block modules meant thousands of tiny
+  WASM modules → "failed to allocate executable memory." DSP code is call-heavy, so following only
+  direct branches gave ~1 block/region (useless). Fixed with **linear batching**: a compact
+  instruction-length decoder (`insnLen`) lets the compiler skip the call/ret/untranslatable
+  terminator and batch a contiguous run of blocks into **one** module — **2.3–5.3× fewer modules**
+  (dblue 3057→575, RoughRider2 893→173). Safe even if the length decoder is wrong: every compiled
+  block is keyed to its own `eip`, so a bad skip only wastes a compile, never corrupts output
+  (self-check: `insnLen` == decoder length for every translatable instruction, 0 mismatches).
+- **Module cache (Firefox exec-memory OOM #2 — "OOM after a few macros in a row").** Because the
+  JIT flushes on every plugin load, the same regions were re-compiled every run and Firefox didn't
+  reclaim the executable memory fast enough → it accumulated until `new WebAssembly.Module` threw
+  `out of memory`. Fixed with a **byte-keyed LRU module cache**: a `WebAssembly.Module`'s compiled
+  code is shared across its instances, so identical module bytes reuse the cached module. Measured
+  on the NWR macro run 3×: **run 1 = 511 modules created, runs 2 & 3 = 0**, all bit-exact — re-runs
+  allocate zero new executable memory. A per-instance **module budget** and an **`oomHalt`** valve
+  cap the footprint and degrade gracefully (decline new modules → interpret) if the ceiling is hit.
+- **Web-Worker parallelism.** A persistent pool of full emulator instances (each with its own JIT +
+  cache): the Kaiser resampler is split across workers (~6×, bit-exact); long single-plugin passes
+  are time-chunked with a per-plugin state-warmup prefix (bit-exact for the chunk-safe set, serial
+  fallback otherwise). Worker-side JIT is opt-in (`cfg.workerJit`).
+- **Load-once: investigated, rejected.** Keeping warmed plugins resident to skip re-compilation
+  measured at **1.9 %** of macro time (region-batched compile is a fixed ~0.1–0.2 s/plugin startup
+  that amortizes away; DSP dominates) — and `resume()` doesn't reset plugin state, so naive reuse
+  wouldn't even be bit-exact. The part of the idea that mattered (don't *re-create* modules) is the
+  module cache above.
+- **Results (172 s sample, every path bit-exact vs the serial interpreter).** JIT'd PB workers:
+  RoughRider2 4.85×, dblue 5.1–5.3×, mda Combo 3.7×. Full `NWR-KIG76Prototype`:
+  **~100 s (interpreter) → ~23 s (serial JIT) → ~11–13 s (JIT'd workers)** — **faster than native
+  Audacity** (~20.7 s). Verified bit-exact across **~120 plugins** (Airwindows + mda + LADSPA).
+  Pre-existing interpreter hangs `mda Tracker` / `librnnoise_vst` excluded from the sweeps.
+
 ## Backport note
 
 The four `cpu.c` x87 fixes (FSCALE, DC reg-form, FXAM, FIST/FISTP) are latent in
-`AcuVoiceRoger\web\emu\cpu.c` too and should be backported.
+`AcuVoiceRoger\web\emu\cpu.c` too and should be backported. The JIT trampoline/dispatch scaffold
+(`g_jitmap` + `emu_jit_request` + the 9 libm trampolines + the `wasm_main.c` layout exports) is a
+further candidate if that emulator ever needs the same multiplicative speedup.
