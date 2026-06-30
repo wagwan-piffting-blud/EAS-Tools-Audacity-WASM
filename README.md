@@ -12,16 +12,27 @@ AcuVoice Roger TTS emulator. The VST2/LADSPA host harness and the Win32 shim are
 
 ## Status (current)
 
-- **x87 + SSE/SSE2** implemented. **~325 / 339 plugin DLLs load and produce audio** headless
-  (337 VST + 2 LADSPA in the manifest). The remaining few trap in their constructor or hit an
+- **x87 + SSE/SSE2** implemented. **~326 / 340 plugin DLLs load and produce audio** headless
+  (338 VST + 2 LADSPA in the manifest). The remaining few trap in their constructor or hit an
   unmodelled path; a **fault guard** (`vst_w_faulted()` / `ladspa_w_faulted()`) stops a
   misbehaving plugin mid-block instead of crashing the host, so a macro chain always completes.
-- **LADSPA host added** (`ladspa_host.c`) — `sc4` (swh RMS compressor) and `chebstortion` run
-  through the same emulator; their `run()` is pure float DSP.
+- **LADSPA host added** (`ladspa_host.c`) — `sc4` (swh RMS compressor) and `chebstortion`
+  (= the `ChebyshevDistortion` macro command) run through the same emulator; their `run()` is
+  pure float DSP.
 - **Shipped in EAS Tools.** The full macro library (**582 macros**) renders end-to-end in the
   browser; a smoke test of all 582 produces audio with **0 silent, 0 crashes**. Headline macros
   (EASyPLUS, NWR-SDR, XJ-FM-v5) were A/B-validated against real Audacity and match (most
   effects bit-exact).
+- **Effect coverage is comprehensive (EAS Tools side).** Every built-in and Nyquist effect the
+  582-macro library invokes is a native-DSP port in `audacity-macro-engine.js`, A/B-validated
+  against real Audacity — bit-exact where the DSP is deterministic (filters, EQ, delays, fades,
+  tape/soft-clip limiters, DTMF, etc.), faithful where it isn't (`Clipper` ≈0.994, `PopMute`
+  ≈0.9998), and statistically matched for the two intentionally non-deterministic effects
+  (`RandomAmplitudeModulation`, `RandomPitchModulation`, which use an unseeded Nyquist `noise`).
+  A census of all 90 distinct macro commands flagged the only remaining gaps as **unbundled
+  third-party VSTs** (`Broadcast`, `Gverb`, `DynamicMirror`, Thimeo tools), three heavier ports
+  (`Reverb` Freeverb, `NoiseReduction` spectral, `Flutter` — source not located), and the
+  deliberate length-edit no-ops (`Delete`/`Trim`, single fixed-length-buffer model).
 
 ## x87 bug fixes in `cpu.c` (the difference between silence/NaN and correct audio)
 

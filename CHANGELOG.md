@@ -45,6 +45,36 @@ ports) lives on the EAS Tools side (`eas-tools/assets/js/audacity-macro-engine.j
   (`Silhouette`); resolution now strips the suffix as a fallback (guarded so it can't hijack a
   built-in effect name like `Distortion`). Recovered ~288 previously-skipped plugins.
 
+## 2026-06 — effect coverage complete (EAS Tools side)
+
+Effect-level DSP lives in `eas-tools/assets/js/audacity-macro-engine.js`, not in this repo, but
+recorded here because it closes out the in-browser renderer. All items A/B-validated against real
+Audacity 2.4.2 via the scripting-pipe harness (`diag_audacity.py` → `compare.py`).
+
+- **Built-in effects ported** (bit-exact unless noted): Phaser, Loudness Normalization (full EBU
+  R128 K-weighting + gated blocks), Auto Duck, Echo, Fade In/Out, Repeat — plus the earlier audit
+  pass (resampler, HP/LP Butterworth, BassTreble, ChangeSpeed, NoiseGate, MultibandEq,
+  HarmonicEnhancer, Compressor, real stereo model).
+- **DTMF Tones** fixed to bit-exact (corr 1.0): the generator now spreads Audacity's leftover
+  `diff` samples (+1 to the first `diff` tone/silence blocks) and uses the float `fs/250` fade —
+  was 0.74 (mis-timed tones) before.
+- **Nyquist `.ny` effects ported by usage** (bit-exact vs Audacity): ParametricEq, Notch Filter,
+  Chebyshev Type I Filter (note: Nyquist's `biquad` negates a1/a2 vs `snd-biquad`, else the
+  16th-order cascade goes unstable → NaN), Comb Filter (delayed feedback form `y[n]=x[n-D]+g·y[n-D]`),
+  Tape Saturation Limiter, Studio Fade Out, Delay (multi-tap), Flanger (linear, resample-based).
+  `Clipper` (≈0.994) and `Pop Mute` (≈0.9998) are faithful but not bit-exact;
+  `RandomAmplitudeModulation` / `RandomPitchModulation` are structural ports — corr 1.0 is
+  impossible because Nyquist's `noise` is unseeded (two identical Audacity runs correlate ~0.79),
+  so they're matched on statistics/energy instead.
+- **Talkbox**: added `mda Talkbox.dll` to the plugin manifest (`norm:"talkbox"`); emulates
+  bit-exact. Manifest is now 340 entries.
+- **Census** of all 90 distinct macro commands across the 582 macros: confirmed every invoked
+  built-in/Nyquist effect and bundled plugin is handled. Remaining gaps are unbundled VSTs
+  (`Broadcast` 46×, `BroadcastLimiterIii`, `Gverb`, `DynamicMirror`, `ThimeoStereoTool`),
+  `Reverb`/`NoiseReduction`/`Flutter` (need native ports or sources), and length-changing edit
+  ops (`Delete`/`Trim`/`SetTrack`/`TrackMove`) which are deliberate no-ops in the single-buffer
+  model. `ChannelMixer` is a correct no-op (all macro uses are on mono tracks).
+
 ## Backport note
 
 The four `cpu.c` x87 fixes (FSCALE, DC reg-form, FXAM, FIST/FISTP) are latent in
